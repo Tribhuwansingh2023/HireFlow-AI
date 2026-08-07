@@ -41,7 +41,8 @@ function InterviewsPage() {
         supabase
           .from("applications")
           .select("id, stage, status, job:jobs(id,title,interview_rounds), candidate:candidates(full_name)")
-          .in("stage", ["shortlisted", "interviewing", "offer"]),
+          .in("stage", ["shortlisted", "interviewing", "offer"])
+          .eq("status", "approved"),
       ]);
       if (ivs.error) throw new Error(ivs.error.message);
       if (apps.error) throw new Error(apps.error.message);

@@ -72,6 +72,7 @@ function JobPipeline() {
           .from("applications")
           .select("*, candidate:candidates(*)")
           .eq("job_id", jobId)
+          .order("manual_rank", { ascending: true, nullsFirst: false })
           .order("match_score", { ascending: false, nullsFirst: false }),
       ]);
       if (job.error) throw new Error(job.error.message);
@@ -180,11 +181,12 @@ function JobPipeline() {
   };
 
   const decide = useMutation({
-    mutationFn: async ({ app, decision }: { app: any; decision: "approved" | "rejected" }) => {
+    mutationFn: async ({ app, decision, comment }: { app: any; decision: "approved" | "rejected"; comment?: string }) => {
       const stage = decision === "approved" ? "shortlisted" : "rejected";
+      const finalComment = comment || `Human ${decision} the agent recommendation “${app.ai_recommendation ?? "n/a"}”.`;
       const { error } = await supabase
         .from("applications")
-        .update({ status: decision, stage })
+        .update({ status: decision, stage, review_comment: comment || null })
         .eq("id", app.id);
       if (error) throw new Error(error.message);
 
@@ -195,7 +197,7 @@ function JobPipeline() {
         decision,
         previous_value: { stage: app.stage, status: app.status } as never,
         new_value: { stage, status: decision } as never,
-        comment: `Human ${decision} the agent recommendation “${app.ai_recommendation ?? "n/a"}”.`,
+        comment: finalComment,
       });
       if (apErr) throw new Error(apErr.message);
 
@@ -205,7 +207,7 @@ function JobPipeline() {
         entity_id: app.id,
         job_id: jobId,
         summary: `${decision === "approved" ? "Approved" : "Rejected"} ${app.candidate?.full_name} — agent had recommended “${app.ai_recommendation ?? "n/a"}” at ${app.match_score ?? "?"}/100.`,
-        details: { decision, agent_recommendation: app.ai_recommendation },
+        details: { decision, agent_recommendation: app.ai_recommendation, comment: finalComment },
       });
     },
     onSuccess: () => {
@@ -213,6 +215,41 @@ function JobPipeline() {
       setOpenApp(null);
       qc.invalidateQueries({ queryKey: ["job", jobId] });
       qc.invalidateQueries({ queryKey: ["dashboard"] });
+    },
+    onError: (e) => toast.error(errorMessage(e)),
+  });
+
+  const changeRank = useMutation({
+    mutationFn: async ({ app, rank, comment }: { app: any; rank: number; comment: string }) => {
+      const { error } = await supabase
+        .from("applications")
+        .update({ manual_rank: rank, review_comment: comment })
+        .eq("id", app.id);
+      if (error) throw new Error(error.message);
+
+      const { error: apErr } = await supabase.from("approvals").insert({
+        application_id: app.id,
+        entity_type: "application",
+        entity_id: app.id,
+        decision: "rank_modified",
+        previous_value: { manual_rank: app.manual_rank } as never,
+        new_value: { manual_rank: rank } as never,
+        comment: comment,
+      });
+      if (apErr) throw new Error(apErr.message);
+
+      await recordAudit({
+        action: "application.rank_modified",
+        entity_type: "application",
+        entity_id: app.id,
+        job_id: jobId,
+        summary: `Modified rank for ${app.candidate?.full_name} to ${rank}.`,
+        details: { previous_rank: app.manual_rank, new_rank: rank, comment },
+      });
+    },
+    onSuccess: () => {
+      toast.success("Rank updated and audited");
+      qc.invalidateQueries({ queryKey: ["job", jobId] });
     },
     onError: (e) => toast.error(errorMessage(e)),
   });
@@ -347,7 +384,7 @@ function JobPipeline() {
             <Pill tone="neutral">Ordered by explainable match score</Pill>
           </div>
           <ul className="divide-y divide-border">
-            {apps.map((app: any) => (
+            {apps.map((app: any, index: number) => (
               <li key={app.id} className="flex flex-wrap items-center gap-4 px-5 py-4 transition-colors hover:bg-surface-2/50">
                 <ScoreRing score={app.match_score} size={52} />
                 <div className="min-w-0 flex-1">
@@ -373,7 +410,7 @@ function JobPipeline() {
                   <Pill tone={STAGE_TONE[app.stage] ?? "neutral"}>{humanise(app.stage)}</Pill>
                   <Pill tone={STATUS_TONE[app.status] ?? "neutral"}>{humanise(app.status)}</Pill>
                   <button
-                    onClick={() => setOpenApp(app)}
+                    onClick={() => setOpenApp({ ...app, listIndex: index + 1 })}
                     className="focus-ring rounded-lg bg-secondary px-3 py-2 text-xs font-medium hover:bg-surface-2"
                   >
                     Review
@@ -390,8 +427,10 @@ function JobPipeline() {
           app={openApp}
           canWrite={canWrite}
           onClose={() => setOpenApp(null)}
-          onDecide={(decision) => decide.mutate({ app: openApp, decision })}
+          onDecide={(decision, comment) => decide.mutate({ app: openApp, decision, comment })}
           deciding={decide.isPending}
+          onChangeRank={(rank, comment) => changeRank.mutate({ app: openApp, rank, comment })}
+          changingRank={changeRank.isPending}
           onRescreen={() => rescreen.mutate(openApp.id)}
           rescreening={rescreen.isPending}
           onEmail={(kind) => email.mutate({ appId: openApp.id, kind })}
@@ -408,6 +447,8 @@ function ReviewDrawer({
   onClose,
   onDecide,
   deciding,
+  onChangeRank,
+  changingRank,
   onRescreen,
   rescreening,
   onEmail,
@@ -416,8 +457,10 @@ function ReviewDrawer({
   app: any;
   canWrite: boolean;
   onClose: () => void;
-  onDecide: (d: "approved" | "rejected") => void;
+  onDecide: (d: "approved" | "rejected", comment?: string) => void;
   deciding: boolean;
+  onChangeRank: (rank: number, comment: string) => void;
+  changingRank: boolean;
   onRescreen: () => void;
   rescreening: boolean;
   onEmail: (kind: string) => void;
@@ -426,6 +469,30 @@ function ReviewDrawer({
   const breakdown = app.score_breakdown ?? {};
   const components: any[] = breakdown.components ?? [];
   const bias = app.bias_notes ?? {};
+
+  const [comment, setComment] = useState(app.review_comment ?? "");
+  const [rank, setRank] = useState(String(app.manual_rank ?? app.listIndex ?? ""));
+
+  const handleReject = () => {
+    if (!comment.trim()) {
+      toast.error("A comment is required when rejecting a candidate.");
+      return;
+    }
+    onDecide("rejected", comment);
+  };
+
+  const handleRank = () => {
+    const r = Number(rank);
+    if (!r || isNaN(r)) {
+      toast.error("Please enter a valid number for rank.");
+      return;
+    }
+    if (!comment.trim()) {
+      toast.error("A comment is required to explain the rank modification.");
+      return;
+    }
+    onChangeRank(r, comment);
+  };
 
   return (
     <div className="fixed inset-0 z-50 flex justify-end bg-background/70 backdrop-blur-sm" onClick={onClose}>
@@ -548,13 +615,42 @@ function ReviewDrawer({
         </section>
 
         {canWrite ? (
-          <div className="sticky bottom-0 mt-8 -mx-6 border-t border-border bg-surface/90 px-6 py-4 backdrop-blur">
-            <p className="mb-3 text-[11px] text-muted-foreground">
+          <div className="sticky bottom-0 mt-8 -mx-6 border-t border-border bg-surface/90 px-6 py-4 backdrop-blur space-y-4">
+            <div className="flex flex-col gap-2">
+              <label htmlFor="review-comment" className="text-xs font-semibold text-muted-foreground">Add a comment (required for rejections & rank changes)</label>
+              <textarea
+                id="review-comment"
+                value={comment}
+                onChange={(e) => setComment(e.target.value)}
+                placeholder="E.g. Strong technical skills, but lacks leadership experience."
+                className="focus-ring w-full resize-y rounded-xl border border-input bg-background/60 px-3 py-2.5 text-sm outline-none focus:border-primary/50 min-h-[80px]"
+              />
+            </div>
+            
+            <div className="flex items-center gap-2 border-b border-border/50 pb-4">
+              <label htmlFor="manual-rank" className="text-xs font-semibold text-muted-foreground whitespace-nowrap">Modify rank</label>
+              <input
+                id="manual-rank"
+                type="number"
+                value={rank}
+                onChange={(e) => setRank(e.target.value)}
+                className="focus-ring w-20 rounded-xl border border-input bg-background/60 px-3 py-1.5 text-sm outline-none focus:border-primary/50"
+              />
+              <button
+                onClick={handleRank}
+                disabled={changingRank}
+                className="focus-ring inline-flex items-center gap-2 rounded-xl border border-border px-3 py-1.5 text-xs font-medium hover:bg-surface-2 disabled:opacity-60"
+              >
+                {changingRank ? <Loader2 className="size-3 animate-spin" /> : "Save rank"}
+              </button>
+            </div>
+
+            <p className="text-[11px] text-muted-foreground">
               Every decision here is written to the approvals ledger and the audit trail.
             </p>
             <div className="flex flex-wrap gap-2">
               <button
-                onClick={() => onDecide("approved")}
+                onClick={() => onDecide("approved", comment)}
                 disabled={deciding}
                 className="focus-ring inline-flex items-center gap-2 rounded-xl bg-success/15 px-4 py-2.5 text-sm font-semibold text-success transition-colors hover:bg-success/25 disabled:opacity-60"
               >
@@ -562,7 +658,7 @@ function ReviewDrawer({
                 Approve & shortlist
               </button>
               <button
-                onClick={() => onDecide("rejected")}
+                onClick={handleReject}
                 disabled={deciding}
                 className="focus-ring inline-flex items-center gap-2 rounded-xl bg-destructive/12 px-4 py-2.5 text-sm font-semibold text-destructive transition-colors hover:bg-destructive/20 disabled:opacity-60"
               >
@@ -577,14 +673,18 @@ function ReviewDrawer({
                 {rescreening ? <Loader2 className="size-4 animate-spin" /> : <RefreshCcw className="size-4" />}
                 Re-screen
               </button>
-              <button
-                onClick={() => onEmail(app.stage === "rejected" ? "rejection" : "interview_invite")}
-                disabled={emailing}
-                className="focus-ring inline-flex items-center gap-2 rounded-xl border border-border px-4 py-2.5 text-sm disabled:opacity-60"
-              >
-                {emailing ? <Loader2 className="size-4 animate-spin" /> : <Mail className="size-4" />}
-                Draft email
-              </button>
+              
+              <div className="relative group inline-flex">
+                <button
+                  onClick={() => onEmail(app.stage === "rejected" ? "rejection" : "interview_invite")}
+                  disabled={emailing || (app.stage !== "rejected" && app.status !== "approved")}
+                  title={(app.stage !== "rejected" && app.status !== "approved") ? "Approve this candidate before scheduling or inviting them." : ""}
+                  className="focus-ring inline-flex items-center gap-2 rounded-xl border border-border px-4 py-2.5 text-sm disabled:opacity-60"
+                >
+                  {emailing ? <Loader2 className="size-4 animate-spin" /> : <Mail className="size-4" />}
+                  Draft email
+                </button>
+              </div>
             </div>
           </div>
         ) : null}
